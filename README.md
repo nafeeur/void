@@ -1,6 +1,6 @@
 # VOID
 
-**LLM chat interfaces are usually boring, so I made one that's cool.**
+***LLM chat interfaces are usually boring, so I made one that's cool.***
 
 ## Some of the states
 
