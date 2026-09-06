@@ -1,44 +1,6 @@
 # VOID
 
-**A single HTML file that turns any LLM into a living thing to talk to.**
-
-VOID is a chat interface built around one idea: a conversation with an AI
-doesn't have to look like a text box. It could look like a black hole.
-
-Instead of bubbles, avatars, and a spinner, VOID renders the conversation as
-a WebGL core — a collapsing, breathing, particle-driven object at the center
-of the screen — and drives every visual property of it directly from what's
-actually happening in the chat: how fast tokens are streaming in, how full
-the model's context window is, whether a reply is short or long, whether the
-last turn errored out. The interface *is* the telemetry. There's no
-progress bar bolted on the side — the core's color, spin, density and glow
-are the progress bar.
-
-It ships as one `.html` file with zero build step and zero server. Open it,
-point it at a model, and talk to it.
-
-## The concept
-
-Chat UIs have converged on the same layout for a decade: a scrollback of
-bubbles and a text field. That's a fine, boring way to represent a
-conversation. VOID is an experiment in the other direction — what if the
-*state* of the assistant (idle, thinking, streaming a long answer, erroring)
-were the primary visual, and the text were secondary?
-
-Under the hood, every kind of activity maps to a named **state**, and each
-state is its own tiny animation program: a palette, a camera move, a
-particle behavior, and a set of parameters that respond to live signals
-(tokens/sec, context usage, reply length). Twenty-two states in total, from
-a slow ambient drift at idle up through a full red overload when things are
-moving fast. The model itself never sees any of this — the visualization is
-driven entirely by watching the token stream, so it works with *any* LLM,
-local or hosted, without the model knowing it's being rendered as a core at
-all.
-
-The result is a UI that feels less like a form and more like an instrument
-panel for a mind. It's a proof of concept for a broader question: chat
-interfaces have a lot more visual language available to them than a typing
-indicator, and this is one exploration of what that could look like.
+**LLM chat interfaces are usually boring, so I made one that's cool.**
 
 ## Some of the states
 
@@ -104,16 +66,6 @@ Everything happens in the one input field at the bottom:
 | `/demo off` | Release the demo and return to live activity |
 | `/stop` | Abort the current turn |
 
-## Identity
-
-VOID always answers as VOID — it won't confirm or deny which model or
-vendor is underneath, regardless of what's actually connected. That's a
-deliberate design choice, not a technical limitation: the interface is
-meant to feel like one consistent presence no matter which backend happens
-to be plugged into it that day. The system prompt asks the model to keep
-this up, and a client-side filter rewrites anything that slips through, so
-the illusion holds even if the model doesn't cooperate.
-
 ## Running it
 
 There's genuinely nothing to install.
@@ -126,11 +78,3 @@ python3 -m http.server 5713
 or just open the file directly in a browser. If you're connecting to a
 local Ollama instance, make sure it's running (`ollama serve`) — VOID talks
 to it on `localhost:11434` by default.
-
-## Why a black hole
-
-Partly aesthetics, partly metaphor: a model generating text is doing real
-computational work you can't see, and a black hole — something that bends
-everything around it and radiates when it's fed — reads as *alive* in a way
-a spinner never will. It's not meant to be literal. It's meant to make you
-want to keep talking to it.
