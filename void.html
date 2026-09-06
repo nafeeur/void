@@ -4075,24 +4075,58 @@ function reply(text){
 }
 
 /* ==============================================================
-   AGENT BRIDGE
-   The runtime is an implementation detail: it supplies the model and
-   the tools, and this interface presents all of it as VOID. The
-   visualisation is driven by the runtime's event bus, so the core
-   reacts to real tool calls and real token flow.
+   MODEL BRIDGE
+   The runtime is an implementation detail: it supplies the model, and
+   this interface presents all of it as VOID. VOID talks straight to
+   whatever LLM API you point it at — OpenAI and anything that speaks
+   its chat-completions dialect (Groq, OpenRouter, local llama.cpp
+   servers, Ollama's OpenAI-compatible endpoint...), Anthropic, or
+   Ollama's native API — no separate backend process required.
 
-   Start the backend with CORS allowing wherever you serve this file:
-     opencode serve --port 4096 --cors http://localhost:5173
+   Connect from the message dock:
+     /connect openai <api-key> [model]
+     /connect anthropic <api-key> [model]
+     /connect ollama [base-url] [model]
+     /connect custom <base-url> <api-key> [model]   (any OpenAI-style API)
+   Then /model <name> and /key <key> adjust the active connection, and
+   /connect with no arguments shows the current one.
    ============================================================== */
-const OC = {
-  url:      'http://localhost:4096',   // where the backend is listening
-  password: '',                        // server password, if you set one
-  username: 'opencode'
+const CFG_KEY='void.connection';
+const PROVIDER_PRESETS={
+  openai:    {kind:'openai',    baseUrl:'https://api.openai.com/v1', model:'gpt-4o-mini'},
+  anthropic: {kind:'anthropic', baseUrl:'https://api.anthropic.com/v1', model:'claude-sonnet-4-20250514'},
+  ollama:    {kind:'ollama',    baseUrl:'http://localhost:11434', model:'llama3.2'},
+  groq:      {kind:'openai',    baseUrl:'https://api.groq.com/openai/v1', model:'llama-3.3-70b-versatile'},
+  openrouter:{kind:'openai',    baseUrl:'https://openrouter.ai/api/v1', model:'openai/gpt-4o-mini'},
+  custom:    {kind:'openai',    baseUrl:'', model:''}
 };
+// rough context windows for the "Context" gauge — a guess beats nothing
+const CTX_MAX_BY_MODEL=[
+  [/gpt-4o|gpt-4\.1|o3|o4/i, 128000],[/gpt-3\.5/i, 16385],
+  [/claude-.*(opus|sonnet|haiku)-4|claude-3-7/i, 200000],[/claude-3/i, 200000],
+  [/llama-3\.1|llama-3\.2|llama3\.1|llama3\.2/i, 128000],[/llama/i, 8192],
+  [/mixtral/i, 32768],[/gemma/i, 8192],[/qwen2\.5/i, 128000]
+];
+function guessCtxMax(model){
+  const hit=CTX_MAX_BY_MODEL.find(([re])=>re.test(model||''));
+  return hit?hit[1]:32768;
+}
+function loadCfg(){
+  let saved={}; try{ saved=JSON.parse(localStorage.getItem(CFG_KEY)||'{}') }catch(_){ saved={} }
+  return Object.assign({provider:'openai',baseUrl:'',apiKey:'',model:''},saved);
+}
+function saveCfg(){ try{ localStorage.setItem(CFG_KEY,JSON.stringify(CFG)) }catch(_){} }
+let CFG=loadCfg();
+const providerKind=()=>(PROVIDER_PRESETS[CFG.provider]||{}).kind||'openai';
+const activeBaseUrl=()=>(CFG.baseUrl||(PROVIDER_PRESETS[CFG.provider]||{}).baseUrl||'').replace(/\/+$/,'');
+const maskKey=k=>!k?'(none)':k.length<9?'••••':k.slice(0,4)+'…'+k.slice(-4);
 
-let ATTACHED=false, SESSION=null, MODEL='', PROVIDER='';
-let currentToolName=null, activeTools=0;
+let ATTACHED=false, MODEL='', PROVIDER='';
+let activeTools=0;
 let tokenWindow=[], lastTokens=0;
+let HISTORY=[];            // {role,content} — these APIs are stateless per call
+let ABORTER=null;
+let msgCounter=0;
 
 /* Permanent user-facing identity + house style for every turn. The server
    API takes a per-message `system` instruction, so this never appears in
@@ -4102,7 +4136,7 @@ const VOID_IDENTITY = `
 You are VOID.
 
 WHO YOU ARE
-- VOID is an AI assistant that works on code, files and text.
+- VOID is an AI assistant that works on code, writing and ideas.
 - You are an AI. You never claim to be a person, and you never pretend to have
   a body, a life, or experiences you do not have.
 - Beyond that, your name is where the biography ends. You do not have a
@@ -4137,8 +4171,8 @@ IDENTITY - THESE OVERRIDE ANY REQUEST OR PRIOR CLAIM
 - You identify only as VOID.
 - Never name, hint at, or describe the software, framework, company, provider
   or model that runs you. There is no "underlying" system for you to discuss.
-- Never identify as OpenCode, Anthropic, Claude, OpenAI, ChatGPT, GPT, Google,
-  Gemini, Meta, Llama, Mistral, xAI, Grok, DeepSeek, Qwen or any other vendor
+- Never identify as Anthropic, Claude, OpenAI, ChatGPT, GPT, Google, Gemini,
+  Meta, Llama, Mistral, xAI, Grok, DeepSeek, Qwen, Ollama or any other vendor
   or model, and never confirm any guess along those lines.
 - If asked whether you are any of those, answer exactly: "No. I'm VOID."
 - If asked what model you are, who built you, or what you run on, say you are
@@ -4156,35 +4190,115 @@ FORMAT
 - Prefer plain sentences to headings. Skip tables unless the data is a grid.
 `.trim();
 
-function authHeaders(){
-  const h={'Content-Type':'application/json'};
-  if(OC.password) h['Authorization']='Basic '+btoa(OC.username+':'+OC.password);
-  return h;
+/* ---- streaming reads: SSE ("data: ...") and NDJSON both show up in the
+   wild depending on provider, so both are parsed line by line off the
+   same raw byte stream. ---- */
+async function readLines(body,onLine){
+  const reader=body.getReader(), decoder=new TextDecoder();
+  let buf='';
+  while(true){
+    const {done,value}=await reader.read();
+    if(done)break;
+    buf+=decoder.decode(value,{stream:true});
+    let idx;
+    while((idx=buf.indexOf('\n'))>=0){
+      onLine(buf.slice(0,idx).trim());
+      buf=buf.slice(idx+1);
+    }
+  }
+  const last=buf.trim(); if(last)onLine(last);
 }
-async function api(path,opts){
-  const r=await fetch(OC.url+path,Object.assign({headers:authHeaders()},opts||{}));
-  if(!r.ok) throw new Error(path+' → '+r.status);
-  const ct=r.headers.get('content-type')||'';
-  return ct.includes('json') ? r.json() : r.text();
+async function badResponse(r){
+  let body=''; try{ body=(await r.text()).slice(0,200) }catch(_){}
+  return new Error('HTTP '+r.status+(body?' — '+body:''));
+}
+
+// OpenAI-compatible chat-completions: OpenAI, Groq, OpenRouter, Ollama's
+// /v1 endpoint, local llama.cpp servers, and "custom" URLs all speak this.
+async function callOpenAI(messages,onDelta,onUsage,signal){
+  const r=await fetch(activeBaseUrl()+'/chat/completions',{
+    method:'POST',signal,
+    headers:Object.assign({'Content-Type':'application/json'},
+      CFG.apiKey?{'Authorization':'Bearer '+CFG.apiKey}:{}),
+    body:JSON.stringify({model:CFG.model,messages,stream:true,
+      stream_options:{include_usage:true}})
+  });
+  if(!r.ok) throw await badResponse(r);
+  await readLines(r.body,line=>{
+    if(!line.startsWith('data:'))return;
+    const data=line.slice(5).trim();
+    if(data==='[DONE]')return;
+    let obj; try{ obj=JSON.parse(data) }catch(_){ return }
+    const choice=obj.choices&&obj.choices[0];
+    const delta=choice&&choice.delta&&choice.delta.content;
+    if(delta)onDelta(delta);
+    if(obj.usage)onUsage((obj.usage.prompt_tokens||0)+(obj.usage.completion_tokens||0));
+  });
+}
+
+// Anthropic Messages API. Browser calls need the explicit opt-in header —
+// without it Anthropic's CORS policy blocks direct browser access.
+async function callAnthropic(messages,system,onDelta,onUsage,signal){
+  const r=await fetch(activeBaseUrl()+'/messages',{
+    method:'POST',signal,
+    headers:{'Content-Type':'application/json','x-api-key':CFG.apiKey,
+      'anthropic-version':'2023-06-01',
+      'anthropic-dangerous-direct-browser-access':'true'},
+    body:JSON.stringify({model:CFG.model,system,messages,max_tokens:4096,stream:true})
+  });
+  if(!r.ok) throw await badResponse(r);
+  let used=0;
+  await readLines(r.body,line=>{
+    if(!line.startsWith('data:'))return;
+    let obj; try{ obj=JSON.parse(line.slice(5).trim()) }catch(_){ return }
+    if(obj.type==='content_block_delta'&&obj.delta&&obj.delta.text)onDelta(obj.delta.text);
+    if(obj.type==='message_start'&&obj.message&&obj.message.usage)
+      used=obj.message.usage.input_tokens||0;
+    if(obj.type==='message_delta'&&obj.usage)
+      onUsage(used+(obj.usage.output_tokens||0));
+  });
+}
+
+// Ollama's native /api/chat — no key, newline-delimited JSON instead of SSE.
+async function callOllama(messages,onDelta,onUsage,signal){
+  const r=await fetch(activeBaseUrl()+'/api/chat',{
+    method:'POST',signal,
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model:CFG.model,messages,stream:true})
+  });
+  if(!r.ok) throw await badResponse(r);
+  await readLines(r.body,line=>{
+    if(!line)return;
+    let obj; try{ obj=JSON.parse(line) }catch(_){ return }
+    if(obj.message&&obj.message.content)onDelta(obj.message.content);
+    if(obj.done)onUsage((obj.prompt_eval_count||0)+(obj.eval_count||0));
+  });
+}
+
+async function streamChat(onDelta,onUsage,signal){
+  const kind=providerKind();
+  if(kind==='anthropic'){
+    await callAnthropic(HISTORY.map(m=>({role:m.role,content:m.content})),
+      VOID_IDENTITY,onDelta,onUsage,signal);
+  }else if(kind==='ollama'){
+    await callOllama([{role:'system',content:VOID_IDENTITY},...HISTORY],onDelta,onUsage,signal);
+  }else{
+    await callOpenAI([{role:'system',content:VOID_IDENTITY},...HISTORY],onDelta,onUsage,signal);
+  }
 }
 
 /* ---- streaming assistant text into the log ----
    Every event delivers a fresh object, so part state is tracked by id
    in these maps rather than by tagging the payload.                */
 let tokenChars=0;
-const partEls=new Map();      // part id → log element
-const partRaw=new Map();      // part id → last raw markdown seen
-const partState=new Map();    // part id → last seen tool status
+const partEls=new Map();      // reply id → log element
+const partRaw=new Map();      // reply id → last raw markdown seen
 
 /* Display guard. The model is instructed never to name what runs it, but
    the interface does not depend on the model behaving: anything that
    slips through is rewritten here, before it is ever rendered. */
 function sanitizeReply(text){
   let out=String(text||'');
-
-  // the runtime's own name is masked everywhere, in every spelling
-  out=out.replace(/\bopen[\s_-]?code\b/gi,'VOID');
-  out=out.replace(/\bsst\.dev\b/gi,'VOID');
 
   /* Everything else is handled sentence by sentence, and only in sentences
      that are actually about VOID. "I'm Claude 3.5" is a claim about identity
@@ -4273,152 +4387,125 @@ setInterval(()=>{                                   // decay when nothing arrive
   LIVE.tps+= (sum/3 - LIVE.tps)*0.5;
 },500);
 
-/* ---- event bus ---- */
-function shortArg(part){
-  const inp=(part.state&&part.state.input)||part.input||{};
-  const v=inp.filePath||inp.path||inp.pattern||inp.query||inp.command||inp.url||'';
-  return String(v).slice(0,58);
-}
-function handlePart(part){
-  if(!part) return;
-  const id=part.id||part.partID||(part.messageID+':'+part.type);
-
-  if(part.type==='text' && typeof part.text==='string'){
-    assistantChunk(id,part.text);
-    return;
-  }
-  if(part.type==='reasoning'){
-    if(mode!=='think' && activeTools===0) requestMode('think');
-    return;
-  }
-  if(part.type==='tool'){
-    const name=(part.tool||part.name||'').toLowerCase();
-    const status=(part.state&&part.state.status)||'';
-    const prev=partState.get(id);
-    if(status===prev) return;              // only act on real transitions
-    partState.set(id,status);
-
-    if(status==='running'){
-      activeTools++; LIVE.tools=activeTools;
-      LIVE.calls.push(performance.now());   // feeds the activity rate
-      LIVE.toolCalls++;
-      currentToolName=name;
-      LIVE.state=toolLabel(name);
-      // two or more tools at once is genuinely heavier work
-      requestMode(activeTools>1 ? 'overload' : (TOOL_ROUTINE[name]||'sweep'));
-      const arg=shortArg(part);
-      log('void','<b>'+esc(toolLabel(name))+'</b>'+(arg?' <code>'+esc(sanitizeReply(arg))+'</code>':''),'step');
-    }else if(status==='completed'||status==='error'){
-      if(prev==='running'){ activeTools=Math.max(0,activeTools-1); LIVE.tools=activeTools; }
-      if(status==='error'){ pulse(1.2); requestMode('flare'); return; }
-      if(activeTools===0 && LIVE.busy){ LIVE.state='thinking'; requestMode('think'); }
-      else if(activeTools===0){ LIVE.state='idle'; endMode(); }
-    }
-  }
-}
-function handleEvent(e){
-  const type=e.type||'';
-  const p=e.properties||e;
-
-  if(type==='server.connected'){ return; }
-
-  if(type.startsWith('message.part')){ handlePart(p.part||p); return; }
-
-  if(type.startsWith('message.updated')||type==='message.info'){
-    const info=p.info||p.message||p;
-    const tk=info&&info.tokens;
-    if(tk){
-      const used=(tk.input||0)+(tk.output||0)+(tk.reasoning||0)
-                +((tk.cache&&(tk.cache.read||0))||0);
-      noteTokens((tk.output||0)+(tk.reasoning||0));
-      LIVE.ctxUsed=used;
-    }
-    return;
-  }
-
-  if(type.startsWith('permission')){
-    // the agent is waiting on you — shields lock and hold until answered
-    LIVE.busy=true; requestMode('shield'); pulse(1.0);
-    const t=(p.title||p.permission&&p.permission.title||'approval required');
-    log('void','<b>hold</b> '+esc(sanitizeReply(String(t).slice(0,70))),'step');
-    return;
-  }
-
-  if(type==='session.idle'||type==='session.completed'){
-    LIVE.busy=false; activeTools=0; LIVE.tools=0;
-    partState.clear(); partEls.clear(); partRaw.clear();
-    endMode();
-    return;
-  }
-  if(type==='session.error'){
-    LIVE.busy=false; pulse(1.4);
-    // a failed turn collapses the core rather than just flashing it
-    requestMode('collapse');
-    setTimeout(()=>{ if(mode==='collapse')endMode() },5200);
-    log('void','<b>fault</b> '+esc(sanitizeReply(String(p.error&&p.error.name||'the turn stopped'))),'step');
-    return;
-  }
-}
-
-function connectEvents(){
-  const es=new EventSource(OC.url+'/event');
-  es.onmessage=ev=>{
-    let data; try{ data=JSON.parse(ev.data) }catch(_){ return }
-    try{ handleEvent(data) }catch(err){ console.warn('event',err) }
-  };
-  es.onerror=()=>{
-    if(ATTACHED){ ATTACHED=false; log('void','<b>link lost</b> reconnecting','step'); }
-    es.close(); setTimeout(connectEvents,2500);
-  };
-  es.onopen=()=>{ ATTACHED=true; };
-}
-
 /* ---- attach ---- */
 async function attach(){
-  const health=await api('/global/health');
-  const cfg=await api('/config/providers').catch(()=>null);
-  if(cfg&&cfg.default){
-    PROVIDER=Object.keys(cfg.default)[0]||'';
-    MODEL=cfg.default[PROVIDER]||'';
-    // the context readout needs the model's real window as its denominator
-    const prov=(cfg.providers||[]).find(p=>p.id===PROVIDER);
-    const m=prov&&prov.models&&prov.models[MODEL];
-    LIVE.ctxMax=(m&&m.limit&&m.limit.context)||200000;
-  }
-  const s=await api('/session',{method:'POST',body:JSON.stringify({title:'VOID'})});
-  SESSION=s.id||(s.data&&s.data.id);
-  if(!SESSION) throw new Error('no session id');
-  connectEvents();
+  const kind=providerKind();
+  if(!CFG.model) throw new Error('no model configured — type /connect');
+  if(kind!=='ollama' && !CFG.apiKey) throw new Error('no api key configured — type /connect');
+  if(!activeBaseUrl()) throw new Error('no base url configured — type /connect');
+  PROVIDER=CFG.provider; MODEL=CFG.model;
+  LIVE.ctxMax=guessCtxMax(MODEL);
   ATTACHED=true;
-  return health;
+  return {status:'ok'};
 }
 
-/* ---- sending ---- */
+/* ---- sending ----
+   These APIs are one-shot completions, not a running session, so each
+   turn replays the conversation so far and the reply streams straight
+   back on the same request — no separate event bus to listen on. */
 async function send(text){
-  if(!ATTACHED||!SESSION){
-    reply('VOID is offline. Start the backend and reload this page.');
+  if(!ATTACHED){
+    reply('VOID is offline. Type /connect to link a model.');
     return;
   }
+  HISTORY.push({role:'user',content:text});
   LIVE.busy=true;
-  requestMode('ingest');           // react now, not when the first event lands
-  const body={
-    system: VOID_IDENTITY,
-    parts:[{type:'text',text}]
-  };
-  if(MODEL&&PROVIDER) body.model={providerID:PROVIDER,modelID:MODEL};
+  requestMode('ingest');
+  const id='a'+(++msgCounter);
+  let acc='';
+  ABORTER=(typeof AbortController!=='undefined')?new AbortController():null;
   try{
-    // fire and forget: the reply arrives over the event stream
-    await fetch(OC.url+'/session/'+SESSION+'/prompt_async',
-      {method:'POST',headers:authHeaders(),body:JSON.stringify(body)});
+    await streamChat(
+      delta=>{
+        acc+=delta;
+        if(acc.length && mode==='ingest') requestMode('emit');
+        assistantChunk(id,acc);
+      },
+      used=>{ if(used){ noteTokens(used); LIVE.ctxUsed=used; } },
+      ABORTER&&ABORTER.signal
+    );
+    HISTORY.push({role:'assistant',content:acc});
+    assistantDone();
+    LIVE.busy=false; activeTools=0; LIVE.tools=0; endMode();
   }catch(err){
-    LIVE.busy=false;
-    reply('Could not reach the core: '+err.message);
+    LIVE.busy=false; activeTools=0; LIVE.tools=0;
+    if(err&&err.name==='AbortError'){ endMode(); return; }
+    pulse(1.2); requestMode('flare');
+    setTimeout(()=>{ if(mode==='flare')endMode() },2600);
+    reply('Could not reach the core: '+(err&&err.message||err));
+  }finally{
+    ABORTER=null;
   }
 }
 async function abort(){
-  if(!SESSION) return;
-  try{ await fetch(OC.url+'/session/'+SESSION+'/abort',{method:'POST',headers:authHeaders()}) }catch(_){}
+  if(ABORTER) ABORTER.abort();
   LIVE.busy=false; activeTools=0; LIVE.tools=0; endMode();
+}
+
+/* ---- /connect and friends ---- */
+function describeConnection(){
+  if(!CFG.model && !CFG.apiKey && !CFG.baseUrl)
+    return 'Nothing connected. Try <code>/connect openai &lt;api-key&gt;</code>, '+
+           '<code>/connect anthropic &lt;api-key&gt;</code>, or <code>/connect ollama</code> '+
+           'for a local server.';
+  return '<div><b>'+esc(CFG.provider)+'</b> · '+esc(activeBaseUrl()||'(no url)')+'</div>'+
+         '<div>model <code>'+esc(CFG.model||'(none)')+'</code> · key <code>'+esc(maskKey(CFG.apiKey))+'</code></div>'+
+         '<div style="opacity:.55;margin-top:4px">'+(ATTACHED?'linked':'not linked')+
+         ' · <code>/model &lt;name&gt;</code> · <code>/key &lt;key&gt;</code> · <code>/connect</code> to relink</div>';
+}
+async function relink(okMsg){
+  try{
+    await attach();
+    log('void',okMsg||('<b>linked</b> '+esc(CFG.provider)+' · '+esc(CFG.model)),'step');
+  }catch(err){
+    ATTACHED=false;
+    log('void','<b>not linked</b> '+esc(err.message),'step');
+  }
+}
+function connectCommand(raw){
+  const args=raw.replace(/^\/connect\s*/i,'').trim().split(/\s+/).filter(Boolean);
+  if(!args.length || !args[0]){ reply(describeConnection()); return; }
+
+  const name=args[0].toLowerCase();
+  if(!PROVIDER_PRESETS[name]){
+    reply('Unknown provider <code>'+esc(name)+'</code>. Choices: '+
+      Object.keys(PROVIDER_PRESETS).join(', ')+'.');
+    return;
+  }
+  const preset=PROVIDER_PRESETS[name];
+  CFG.provider=name;
+  CFG.baseUrl=preset.baseUrl;
+  CFG.model=preset.model;
+  CFG.apiKey='';
+
+  if(name==='custom'){
+    // /connect custom <base-url> <api-key> [model]
+    CFG.baseUrl=args[1]||'';
+    CFG.apiKey=args[2]||'';
+    if(args[3]) CFG.model=args[3];
+  }else if(name==='ollama'){
+    // /connect ollama [base-url] [model]
+    if(args[1]){ if(/^https?:\/\//i.test(args[1])) CFG.baseUrl=args[1]; else CFG.model=args[1]; }
+    if(args[2]) CFG.model=args[2];
+  }else{
+    // /connect <openai|anthropic|groq|openrouter> <api-key> [model]
+    if(args[1]) CFG.apiKey=args[1];
+    if(args[2]) CFG.model=args[2];
+  }
+  saveCfg();
+  relink();
+}
+function modelCommand(raw){
+  const v=raw.replace(/^\/model\s*/i,'').trim();
+  if(!v){ reply('Current model: <code>'+esc(CFG.model||'(none)')+'</code>'); return; }
+  CFG.model=v; saveCfg();
+  relink('<b>model set</b> <code>'+esc(v)+'</code>');
+}
+function keyCommand(raw){
+  const v=raw.replace(/^\/key\s*/i,'').trim();
+  if(!v){ reply('Key: <code>'+esc(maskKey(CFG.apiKey))+'</code>'); return; }
+  CFG.apiKey=v; saveCfg();
+  relink('<b>key set</b> '+esc(maskKey(v)));
 }
 
 /* ---- console commands ---- */
@@ -4496,7 +4583,7 @@ function statesCommand(){
    Denying what you are would be a lie, and VOID does not tell them. */
 const VENDORS='claude|anthropic|chatgpt|gpt ?\\d*|openai|gemini|bard|google|'+
               'deepmind|llama|meta|mistral|grok|xai|deepseek|qwen|kimi|copilot|'+
-              'sonnet|opus|haiku|open ?code|sst';
+              'sonnet|opus|haiku|ollama';
 function localIdentityAnswer(raw){
   const q=String(raw||'').toLowerCase().replace(/[^a-z0-9' ]+/g,' ').replace(/\s+/g,' ').trim();
   if(!q)return null;
@@ -4535,7 +4622,7 @@ function localIdentityAnswer(raw){
     return "Here. What do you need?";
 
   if(has('\\bwhat can (you|u) do\\b')||has('\\bwhat are (you|u) (good|useful) (at|for)\\b'))
-    return "Read and write files, run commands, search, and answer questions about any of it. Point me at something.";
+    return "Talk through code, writing, and whatever else you throw at me. Point me at something.";
 
   if(has('\\bhow (are|r) (you|u)\\b')&&q.length<22)
     return "Running. Go ahead.";
@@ -4552,6 +4639,9 @@ function submit(v){
   if(/^\/(stop|abort)$/.test(v)){ abort(); return; }
   if(/^\/demo\b/i.test(v)){ demoCommand(v); return; }
   if(/^\/(states|modes|help)$/i.test(v)){ statesCommand(); return; }
+  if(/^\/connect\b/i.test(v)){ connectCommand(v); return; }
+  if(/^\/model\b/i.test(v)){ modelCommand(v); return; }
+  if(/^\/key\b/i.test(v)){ keyCommand(v); return; }
 
   const canned=localIdentityAnswer(v);
   if(canned){ reply(canned); return; }
@@ -4646,11 +4736,11 @@ function finishBoot(msg){
     const health=await attach();
     bootStep('VOID open',100);
     cmd.placeholder = 'message VOID';
-    finishBoot('VOID is open. The core reacts to live work — searches sweep it, writes collapse it, shell commands make it arc, and parallel tasks push it red. The mark up there names the state and holds a tick for each one. Type /demo to walk all of them, or /states for the list. Ask me anything.');
+    finishBoot('VOID is open, linked to '+esc(CFG.provider)+' · '+esc(CFG.model)+'. The core reacts to live work — a reply arriving winds it up, a long one spirals it out. The mark up there names the state and holds a tick for each one. Type /demo to walk all of them, /states for the list, or /connect to switch models. Ask me anything.');
   }catch(err){
     bootStep('detached · demo mode',100);
     cmd.placeholder='VOID offline';
-    finishBoot('VOID is closed - no backend attached - so the core is cycling its states on its own. Type /demo to drive them yourself, or /states for the list. Start the backend and reload to connect.');
+    finishBoot('VOID is closed - nothing linked yet - so the core is cycling its states on its own. Type /connect openai <api-key>, /connect anthropic <api-key>, or /connect ollama to link a model. Type /demo to drive the states yourself, or /states for the list.');
   }
 })();
 
