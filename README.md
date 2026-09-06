@@ -6,9 +6,10 @@
 
 | | | |
 |---|---|---|
-| ![idle](screenshots/idle.jpg) **standby** — nothing happening, the core drifts on its own ambient rhythm | ![think](screenshots/think.jpg) **think** — slow wide drift while the model reasons | ![spiral](screenshots/spiral.jpg) **spiral** — a long reply arriving; the disk winds up as it streams in |
-| ![discharge](screenshots/discharge.jpg) **discharge** — a shell/tool-style burst, arcs firing across the mesh | ![overload](screenshots/overload.jpg) **overload** — heavy concurrent work, the core runs hot and red | ![weave](screenshots/weave.jpg) **weave** — an edit-shaped state, helix and rings interlocking |
-| ![crystal](screenshots/crystal.jpg) **crystal** — a planning state, the lattice locks into place | | |
+| ![idle](screenshots/idle.jpg) **standby** — nothing happening, the core drifts on its own ambient rhythm | ![dream](screenshots/dream.jpg) **dream** — deep idle, the sky comes all the way forward | ![think](screenshots/think.jpg) **think** — slow wide drift while the model reasons |
+| ![spiral](screenshots/spiral.jpg) **spiral** — a long reply arriving; the disk winds up as it streams in | ![discharge](screenshots/discharge.jpg) **discharge** — a shell/tool-style burst, arcs firing across the mesh | ![weave](screenshots/weave.jpg) **weave** — an edit-shaped state, helix and rings interlocking |
+| ![crystal](screenshots/crystal.jpg) **crystal** — a planning state, the lattice locks into place | ![shield](screenshots/shield.jpg) **shield** — waiting on you, shields lock until answered | ![overload](screenshots/overload.jpg) **overload** — heavy concurrent work, the core runs hot and red |
+| ![nova](screenshots/nova.jpg) **nova** — sustained overload, the core blazes over | ![flare](screenshots/flare.jpg) **flare** — a hard flash on error, decaying back | ![collapse](screenshots/collapse.jpg) **collapse** — a fault, maximum curvature, the horizon takes the frame |
 
 Type `/states` in the dock to see the full list of 22, or `/demo` to watch
 VOID cycle through all of them, or `/demo <name>` to hold one and study it.
