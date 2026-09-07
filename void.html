@@ -1047,19 +1047,34 @@ const compMat=new THREE.ShaderMaterial({
             uBloom:{value:1.35},uTime:{value:0},uShift:{value:0},
             uLensPos:{value:new THREE.Vector2(.5,.5)},uLensStr:{value:0},
             uHorizon:{value:.04},uAspect:{value:1},uShimmer:{value:0},
-            uNebula:{value:.32},uVolume:{value:.35},uEnergyFx:{value:0}},
+            uNebula:{value:.32},uVolume:{value:.35},uEnergyFx:{value:0},
+            uEchoAge:{value:10},uEchoPower:{value:0}},
   vertexShader:quadVert,
   fragmentShader:`
     uniform sampler2D tScene;uniform sampler2D tBloomA;uniform sampler2D tBloomB;
     uniform float uBloom;uniform float uTime;uniform float uShift;
     uniform vec2 uLensPos;uniform float uLensStr;uniform float uHorizon;uniform float uAspect;
     uniform float uShimmer;uniform float uNebula;uniform float uVolume;uniform float uEnergyFx;
+    uniform float uEchoAge;uniform float uEchoPower;
     varying vec2 vUv;
     float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
     float noise2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x),f.y);}
     float fbm(vec2 p){float a=.5,n=0.0;for(int i=0;i<5;i++){n+=noise2(p)*a;p=p*2.03+vec2(17.2,9.1);a*=.5;}return n;}
     void main(){
       vec2 uv=vUv;
+      // A bounded, traveling refraction: no full-screen exposure flash.
+      // Aspect correction keeps the echo circular on portrait displays.
+      if(uEchoPower>0.001 && uEchoAge<2.8){
+        vec2 ed=(uv-uLensPos)*vec2(uAspect,1.0);
+        float er=length(ed);
+        float front=uEchoAge*.24;
+        float envelope=sin(clamp(uEchoAge/2.8,0.0,1.0)*3.141593);
+        float band=exp(-pow((er-front)/.026,2.0));
+        float wake=exp(-pow((er-front+.045)/.045,2.0));
+        uv+=ed/max(er,.001)*vec2(1.0/uAspect,1.0)
+          *(band-wake*.38)*envelope*uEchoPower*.007;
+        uv=clamp(uv,vec2(.001),vec2(.999));
+      }
 
       /* Gravitational lensing, done in screen space. Every sample is pulled
          toward the core, with the deflection falling off as 1/r2 and dying
@@ -1332,6 +1347,260 @@ const shared={uTime:{value:0},uAmp:{value:0},uScan:{value:-1.5},uPulse:{value:0}
               uRadK:{value:1},uEnergy:{value:0},uTint:{value:0},
               uFocus:{value:7.5},uAperture:{value:.055},uPR:{value:PR},uTex:{value:TEX}};
 const u=x=>Object.assign({},shared,x);
+
+/* ---- orbital filaments ----
+   One draw call, immutable geometry, GPU-driven motion. The traveling
+   crests expose the curves a piece at a time, leaving the core readable.
+   Sharing the halo fade keeps these within each state's composition. */
+const filamentCount=12, filamentSteps=160;
+const filamentPositions=new Float32Array(filamentCount*filamentSteps*2*3);
+let filamentCursor=0;
+for(let strand=0;strand<filamentCount;strand++){
+  for(let step=0;step<filamentSteps;step++){
+    for(let endpoint=0;endpoint<2;endpoint++){
+      filamentPositions[filamentCursor++]=(step+endpoint)/filamentSteps;
+      filamentPositions[filamentCursor++]=strand;
+      filamentPositions[filamentCursor++]=0;
+    }
+  }
+}
+const filamentGeo=new THREE.BufferGeometry();
+filamentGeo.setAttribute('position',new THREE.BufferAttribute(filamentPositions,3));
+const filamentMat=new THREE.ShaderMaterial({
+  uniforms:u({uFade:{value:1},uFlow:{value:0},uTravel:{value:0},uWeave:{value:0}}),
+  vertexShader:FIELD+`
+    uniform float uFlow;uniform float uTravel;uniform float uWeave;
+    varying float vLight;varying float vBand;
+    void main(){
+      float strand=position.y;
+      float path=position.x;
+      float phase=strand*2.399963;
+      float angle=path*6.283185+phase+uTime*.065;
+      float braid=angle*3.0+phase+uTime*.16;
+      float radius=1.7+strand*.055+sin(braid)*(.07+uWeave*.19);
+      vec3 p=vec3(cos(angle)*radius,
+        sin(angle*2.0+phase)*(.12+uWeave*.24),sin(angle)*radius);
+      float tilt=.32+sin(phase)*.48;
+      p.yz=mat2(cos(tilt),-sin(tilt),sin(tilt),cos(tilt))*p.yz;
+      float crest=.5+.5*cos(angle-uTravel-phase);
+      vLight=.025+pow(crest,24.0)*(.35+uFlow*.65);
+      vBand=strand/12.0;
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0);
+    }`,
+  fragmentShader:FIELD+`
+    uniform float uFade;varying float vLight;varying float vBand;
+    void main(){
+      vec3 c=hueRot(ramp(clamp(uEnergy*.7+.2+vBand*.12,0.0,1.0)),uTint+vBand*.65);
+      gl_FragColor=vec4(c*vLight,vLight*uFade*.48);
+    }`,
+  transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+});
+// reg() shares the existing halo composition rather than adding another layer
+// to every state. No texture, render target, or per-frame geometry allocation.
+reg(filamentMat,'halo');
+const filaments=new THREE.LineSegments(filamentGeo,filamentMat);
+filaments.frustumCulled=false;
+core.add(filaments);
+let echoAge=10,echoPower=0;
+const braidedModes=new Set(['weave','think','crystal','spiral']);
+
+/* ==============================================================
+   COSMIC SCORE
+   Five bounded mathematical sculptures, not a second particle loop.
+   Static geometry + shared shader clock; a state selects the soloist.
+   ============================================================== */
+const cosmicRoot=new THREE.Group();scene.add(cosmicRoot);
+const cosmicSystems=[];
+const COSMIC_VERTEX=FIELD+`
+  attribute vec2 aInfo;
+  uniform float uClock;uniform float uStrength;uniform float uKind;
+  uniform float uMotion;uniform float uPixelRatio;
+  varying float vLight;varying float vHue;
+  void main(){
+    vec3 p=position;
+    float path=aInfo.x,band=aInfo.y;
+    float tau=6.2831853;
+    float phase=band*tau;
+    // Bounded radial breathing preserves topology; no accumulated drift.
+    float breath=sin(uClock*.18+phase)*.025*uMotion;
+    p*=1.0+breath;
+    float crest=.5+.5*cos(path*tau*3.0-uClock*.47+phase);
+    vLight=.10+pow(crest,18.0)*.90;
+    if(uKind>3.5){
+      // Two spherical standing modes: nodal curves become luminous lace.
+      float theta=path*3.14159265,phi=phase;
+      float f=sin(theta*5.0)*cos(phi*3.0+uClock*.07);
+      float g=sin(theta*3.0)*sin(phi*5.0-uClock*.11);
+      float wave=f*cos(uClock*.19)+g*sin(uClock*.19);
+      p*=1.0+wave*.14;
+      vLight=.08+exp(-abs(wave)*17.0)*.9;
+    }
+    if(uKind>2.5 && uKind<3.5){
+      // Logarithmic spiral arms carry slow packets toward the horizon.
+      float packet=.5+.5*cos(path*tau*2.0+uClock*.33+phase);
+      vLight=.08+pow(packet,12.0)*.8;
+    }
+    vec4 mv=modelViewMatrix*vec4(p,1.0);
+    gl_Position=projectionMatrix*mv;
+    gl_PointSize=clamp(uPixelRatio*(1.2+vLight*1.3)*7.0/max(.5,-mv.z),1.0,5.0);
+    vLight*=uStrength;
+    vHue=band*.55+uKind*.13;
+  }`;
+const COSMIC_FRAGMENT=FIELD+`
+  uniform float uKind;varying float vLight;varying float vHue;
+  void main(){
+    float coverage=1.0;
+    if(uKind>3.5){
+      float r=length(gl_PointCoord-.5)*2.0;
+      coverage=1.0-smoothstep(.15,1.0,r);
+    }
+    vec3 c=hueRot(ramp(clamp(.20+uEnergy*.52+vHue*.16,0.0,1.0)),uTint+vHue);
+    gl_FragColor=vec4(c*(.7+vLight*.65),coverage*vLight*.42);
+  }`;
+function cosmicGeometry(vertices,info){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(vertices,3));
+  g.setAttribute('aInfo',new THREE.Float32BufferAttribute(info,2));
+  return g;
+}
+function cosmicObject(kind,geometry,points=false,groupVertices=2){
+  const m=new THREE.ShaderMaterial({
+    uniforms:{uEnergy:{value:0},uTint:{value:0},uClock:{value:0},
+      uStrength:{value:0},uKind:{value:kind},uMotion:{value:1},uPixelRatio:{value:PR}},
+    vertexShader:COSMIC_VERTEX,fragmentShader:COSMIC_FRAGMENT,
+    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+  });
+  const o=points?new THREE.Points(geometry,m):new THREE.LineSegments(geometry,m);
+  o.frustumCulled=false;cosmicRoot.add(o);
+  const item={object:o,material:m,strength:0,count:geometry.attributes.position.count,points,groupVertices};
+  cosmicSystems.push(item);return item;
+}
+function cosmicCurve(vertices,info,steps,band,point){
+  let previous=point(0);
+  for(let j=1;j<=steps;j++){
+    const next=point(j/steps);
+    vertices.push(...previous,...next);
+    info.push((j-1)/steps,band,j/steps,band);
+    previous=next;
+  }
+}
+// 01 · Hopf fibers. Complex phase orbits on S³, stereographically
+// projected to R³. eta stays away from the projection pole.
+{
+  const v=[],a=[],fibers=24,steps=144;
+  for(let k=0;k<fibers;k++){
+    const eta=.42+.48*vdc(k+1,2),phi=k*GA;
+    cosmicCurve(v,a,steps,k/fibers,q=>{
+      const t=q*Math.PI*2,den=1-Math.sin(eta)*Math.sin(t);
+      return [.82*Math.cos(eta)*Math.cos(t+phi)/den,
+        .82*Math.cos(eta)*Math.sin(t+phi)/den,
+        .82*Math.sin(eta)*Math.cos(t)/den];
+    });
+  }
+  cosmicObject(0,cosmicGeometry(v,a),false,288);
+}
+// 02 · Lorenz orbit (sigma=10, rho=28, beta=8/3).
+// Fourth-order Runge–Kutta, h=.005; discard the initial transient.
+function lorenzDerivative(p){return [10*(p[1]-p[0]),p[0]*(28-p[2])-p[1],p[0]*p[1]-8*p[2]/3]}
+function lorenzStep(p){
+  const h=.005,k1=lorenzDerivative(p);
+  const k2=lorenzDerivative(p.map((x,i)=>x+h*k1[i]/2));
+  const k3=lorenzDerivative(p.map((x,i)=>x+h*k2[i]/2));
+  const k4=lorenzDerivative(p.map((x,i)=>x+h*k3[i]));
+  return p.map((x,i)=>x+h*(k1[i]+2*k2[i]+2*k3[i]+k4[i])/6);
+}
+{
+  const v=[],a=[];let p=[.1,0,0];
+  for(let i=0;i<1400;i++)p=lorenzStep(p);
+  const samples=6400;
+  for(let i=0;i<samples;i++){
+    const previous=p;p=lorenzStep(lorenzStep(p));
+    v.push(previous[0]*.10,(previous[2]-26)*.10,previous[1]*.10,
+      p[0]*.10,(p[2]-26)*.10,p[1]*.10);
+    a.push(i/samples,0,(i+1)/samples,0);
+  }
+  cosmicObject(1,cosmicGeometry(v,a));
+}
+// 03 · Nested (2,3) torus knots, rotated about incommensurate axes.
+// Every curve closes exactly; the golden angle distributes their planes.
+{
+  const v=[],a=[],knots=9;
+  for(let k=0;k<knots;k++){
+    const tilt=k*GA,cs=Math.cos(tilt),sn=Math.sin(tilt);
+    cosmicCurve(v,a,256,k/knots,q=>{
+      const t=q*Math.PI*2,r=1.48+.34*Math.cos(t*3),
+        x=r*Math.cos(t*2),y=r*Math.sin(t*2),z=.34*Math.sin(t*3);
+      return [x,y*cs-z*sn,y*sn+z*cs];
+    });
+  }
+  cosmicObject(2,cosmicGeometry(v,a),false,512);
+}
+// 04 · Golden logarithmic ribbons. r=a exp(b theta), with radial
+// separation multiplied by phi per revolution. Twin rails make depth legible.
+{
+  const v=[],a=[],arms=13;
+  for(let k=0;k<arms;k++){
+    for(let rail=0;rail<2;rail++){
+      cosmicCurve(v,a,144,k/arms,q=>{
+        const theta=q*Math.PI*4,angle=theta+k*GA;
+        const r=.88*Math.exp(Math.log(PHI)*theta/(2*Math.PI));
+        return [Math.cos(angle)*r,
+          Math.sin(theta*.5+k*GA)*.36+(rail-.5)*.035,
+          Math.sin(angle)*r];
+      });
+    }
+  }
+  cosmicObject(3,cosmicGeometry(v,a),false,288);
+}
+// 05 · Fibonacci sphere carrying two spherical standing-wave modes.
+// Equal-area sampling avoids a concentration of points at the poles.
+{
+  const v=[],a=[],count=5200;
+  for(let k=0;k<count;k++){
+    const y=1-2*(k+.5)/count,theta=Math.acos(y),phi=k*GA;
+    const r=Math.sqrt(1-y*y);
+    v.push(Math.cos(phi)*r*2.15,y*2.15,Math.sin(phi)*r*2.15);
+    a.push(theta/Math.PI,((phi/(Math.PI*2))%1+1)%1);
+  }
+  cosmicObject(4,cosmicGeometry(v,a),true);
+}
+// Each score names one lead and one accompaniment. Existing busy states
+// receive only a quiet accent; crossfades keep transitions continuous.
+const COSMIC_SCORE={
+  hopf:[1,.0,.18,0,.12],attractor:[0,1,0,.12,0],
+  orrery:[.18,0,1,0,.08],chrysalis:[.12,0,0,0,1],
+  cathedral:[0,0,.14,1,.24],
+  dream:[.25,0,0,.12,.20],drift:[.20,0,0,.08,0],
+  think:[0,.38,0,0,.08],weave:[.30,0,.22,0,0],
+  crystal:[.10,0,.16,0,.25],shield:[0,0,.14,0,.20],
+  spiral:[0,0,0,.38,0],resonate:[.18,0,0,0,.28],
+  stream:[0,.20,0,0,0],ingest:[0,0,0,.22,0],
+  disperse:[.16,0,0,.12,0],scatter:[0,0,0,.18,.12],
+  idle:[.16,0,0,0,.10]
+};
+const COSMIC_SILENT=[0,0,0,0,0];
+let cosmicClock=0;
+function updateCosmos(dt){
+  // A dedicated clock freezes the new sculptures under reduced motion.
+  if(!reduced)cosmicClock+=dt;
+  const t=cosmicClock,score=COSMIC_SCORE[mode]||COSMIC_SILENT;
+  cosmicRoot.position.copy(core.position);
+  for(let i=0;i<cosmicSystems.length;i++){
+    const c=cosmicSystems[i],u=c.material.uniforms;
+    c.strength=damp(c.strength,score[i],1.05,dt);
+    c.object.visible=c.strength>.003;
+    u.uStrength.value=c.strength*(QL.level>=3?.65:1);
+    u.uClock.value=t;u.uMotion.value=reduced?0:1;
+    u.uEnergy.value=reduced?.15:energy;u.uTint.value=P.tint;
+    u.uPixelRatio.value=RPR;
+    // Only point samples may be thinned arbitrarily. Line ranges end on
+    // pairs; lower quality retains a complete subset of each sculpture.
+    const fraction=c.points?[1,.8,.55,.32][QL.level]:[1,1,.75,.5][QL.level];
+    c.object.geometry.setDrawRange(0,Math.floor(c.count*fraction/c.groupVertices)*c.groupVertices);
+    c.object.rotation.set(Math.sin(t*HR[0]*.23+i)*.20,
+      t*HR[0]*(i%2?-.16:.13),Math.sin(t*HR[1]*.11+i)*.12);
+  }
+}
 
 /* ---- particle cloud ---- */
 const CLOUD_N=9000;
@@ -2643,6 +2912,24 @@ const MODES={
     (t,mt)=>{PT.lens=3.6+Math.sin(t*HR[2])*.45;PT.horizonK=1.7+Math.min(mt,8)*.05},
     ()=>pulse(1.5))
 };
+// Long-form mathematical scenes, also available through /demo <name>.
+Object.assign(MODES,{
+  hopf:state({heat:.22,tint:1.25,spread:1.2,bloom:1.30,spin:.012,
+    zoom:1.24,offX:0,offY:0,camAz:.18,camEl:.16,lens:.65,
+    show:['stars','halo','dust'],gesture:'bloom'}),
+  attractor:state({heat:.36,tint:-.35,spread:1.1,bloom:1.22,spin:.015,
+    zoom:1.38,offX:0,offY:0,camAz:.10,camEl:.12,lens:.45,
+    show:['stars','halo'],gesture:'bloom'}),
+  orrery:state({heat:.30,tint:2.1,spread:.9,bloom:1.32,spin:.012,
+    zoom:1.18,offX:0,offY:0,camAz:-.22,camEl:.22,lens:.60,
+    show:['stars','halo','gimbal'],gesture:'iris'}),
+  chrysalis:state({heat:.18,tint:.62,spread:1.3,bloom:1.18,spin:.01,
+    zoom:1.22,offX:0,offY:0,camAz:.12,camEl:.10,lens:.55,
+    show:['stars','halo'],gesture:'bloom'}),
+  cathedral:state({heat:.32,tint:1.65,spread:1.4,bloom:1.28,spin:.014,
+    zoom:1.34,offX:0,offY:0,camAz:.25,camEl:.46,lens:.70,
+    show:['stars','halo','dust'],gesture:'bloom'})
+});
 const MODE_KEYS=Object.keys(MODES);
 const AMBIENT_MODES=['drift','resonate','crystal','dream'];
 
@@ -2679,7 +2966,7 @@ const toolLabel=n=>TOOL_LABEL[n]||String(n||'work').replace(/[_-]+/g,' ');
    it just lands a beat later. */
 const MIN_DWELL=.5;
 let pendingMode=null;
-let demoLock=false, demoT=0, demoQueue=[];
+let demoLock=false, demoT=0, demoQueue=[],demoPace=1;
 
 function startMode(name){
   if(!MODES[name])return;
@@ -2693,6 +2980,7 @@ function startMode(name){
               hold:1.1,decay:2.2});}
   recent.push(name);if(recent.length>4)recent.shift();
   MODES[name].enter();
+  if(!reduced){echoAge=0;echoPower=.45+Math.min(.55,energy*.55)}
 }
 function requestMode(name){
   if(!MODES[name]||demoLock)return;
@@ -3376,7 +3664,14 @@ const lensC=new THREE.Vector3(),lensE=new THREE.Vector3(),lensUp=new THREE.Vecto
 const coreScreen={x:0,y:0};
 const scanEl=$('scanline'), cycleEl=document.querySelector('#cycle i');
 const clock=new THREE.Clock();
-const reduced=matchMedia('(prefers-reduced-motion:reduce)').matches;
+let animationTime=0;
+const motionQuery=matchMedia('(prefers-reduced-motion:reduce)');
+let reduced=motionQuery.matches;
+motionQuery.addEventListener('change',event=>{
+  reduced=event.matches;
+  if(reduced){echoAge=10;echoPower=0}
+  setQuality(QL.level);
+});
 let TRAILS=!reduced;
 outMat.uniforms.tTrail.value=rtT1.texture;
 if(!TRAILS) outMat.uniforms.uGain.value=0;
@@ -3439,7 +3734,20 @@ const CINE={
 
 function tick(){
   requestAnimationFrame(tick);
-  const dt=Math.min(clock.getDelta(),.05),t=clock.elapsedTime;
+  // Advance visual time only while visible; bound the first returning frame.
+  const elapsed=clock.getDelta();
+  if(document.hidden)return;
+  const dt=Math.min(elapsed,.05);
+  const t=animationTime+=dt;
+  echoAge+=dt;
+  compMat.uniforms.uEchoAge.value=echoAge;
+  compMat.uniforms.uEchoPower.value=reduced||QL.level>=2?0:echoPower;
+  filaments.visible=!reduced&&QL.level<3;
+  filamentGeo.setDrawRange(0,(QL.level>=2?6:filamentCount)*filamentSteps*2);
+  filamentMat.uniforms.uFlow.value=damp(filamentMat.uniforms.uFlow.value,energy,2.5,dt);
+  filamentMat.uniforms.uTravel.value+=dt*(.36+filamentMat.uniforms.uFlow.value*.7);
+  const weaveTarget=braidedModes.has(mode)?1:0;
+  filamentMat.uniforms.uWeave.value=damp(filamentMat.uniforms.uWeave.value,weaveTarget,1.4,dt);
 
   // frame-time watchdog: a slow exponential average, so one hitch never
   // triggers a downgrade but a genuinely struggling machine always does
@@ -3469,7 +3777,7 @@ function tick(){
       if(demoT<=0){
         if(demoQueue.length){
           const nx=demoQueue.shift();
-          startMode(nx);demoT=4.6+gr()*2.6;
+          startMode(nx);demoT=(4.6+gr()*2.6)*demoPace;
           log('void','<b>demo</b> '+esc(nx),'step');
         }else{
           demoLock=false;endMode();
@@ -3765,6 +4073,7 @@ function tick(){
   rootStyle.setProperty('--camera-zoom',Math.max(-1,Math.min(1,(7.5-camera.position.z)/4.2)).toFixed(3));
   rootStyle.setProperty('--horizon-fall',fall.toFixed(3));
 
+  updateCosmos(dt);
   computeTelemetry(dt);
   if(++markFrame>=markEvery){paintMark(dt*markEvery,t);markFrame=0}
   if(!booted||bootExit>0){
@@ -3829,7 +4138,7 @@ function tick(){
     // longer trails the harder the core is working
     trailMat.uniforms.tCur.value=rtComp.texture;
     trailMat.uniforms.tPrev.value=trailPrev.texture;
-    trailMat.uniforms.uDecay.value=Math.min(.94,.70+energy*.20+pulseV*.10+surge*.05);
+    trailMat.uniforms.uDecay.value=Math.pow(Math.min(.94,.70+energy*.20+pulseV*.10+surge*.05),dt*60);
     renderer.setRenderTarget(trailCur);renderer.render(trailScene,quadCam);
     const swap=trailPrev;trailPrev=trailCur;trailCur=swap;
     outMat.uniforms.tTrail.value=trailPrev.texture;
@@ -4510,6 +4819,11 @@ function keyCommand(raw){
 
 /* ---- console commands ---- */
 const STATE_DESC={
+  hopf:'linked circles — a projection of a four-dimensional sphere',
+  attractor:'deterministic chaos — a luminous Lorenz orbit',
+  orrery:'nested torus knots — closed curves in revolving planes',
+  chrysalis:'standing waves — luminous nodes on a spherical shell',
+  cathedral:'golden logarithmic spirals — an expanding celestial vault',
   dream:'deep idle - the sky comes all the way forward',
   drift:'long idle - everything settles',
   resonate:'idle rhythm - a standing wave through the core',
@@ -4539,6 +4853,7 @@ function stateSwatch(k){
   return cssRGB(hueRotJS(rampJS(Math.min(1,(pal.heat||0)*1.02+.07)),pal.tint||0));
 }
 function demoCommand(raw){
+  demoPace=1;
   const arg=raw.replace(/^\/demo\s*/i,'').trim().toLowerCase();
 
   if(/^(off|stop|end|release)$/.test(arg)){
@@ -4562,6 +4877,13 @@ function demoCommand(raw){
   log('void','No state called <code>'+esc(arg)+'</code>. '+
     MODE_KEYS.map(k=>'<span style="color:'+stateSwatch(k)+'">'+k+'</span>').join(' · '));
 }
+function cosmosCommand(raw){
+  const arg=raw.replace(/^\/cosmos\s*/i,'').trim();
+  if(arg){demoCommand('/demo '+arg);return;}
+  demoQueue=['hopf','chrysalis','attractor','orrery','cathedral'];
+  demoLock=true;demoT=0;demoPace=2.6;
+  reply('Five mathematical worlds, about sixteen seconds each. /cosmos off to return.');
+}
 function statesCommand(){
   const rows=MODE_KEYS.map(k=>
     '<div style="display:flex;gap:9px"><span style="color:'+stateSwatch(k)+
@@ -4570,7 +4892,7 @@ function statesCommand(){
   log('void','<div style="margin-bottom:5px"><b>'+MODE_KEYS.length+' states</b>, coldest first</div>'+rows+
     '<div style="margin-top:6px;opacity:.55"><code>/demo</code> runs them all · '+
     '<code>/demo &lt;state&gt;</code> holds one · <code>/demo off</code> releases · '+
-    '<code>/stop</code> aborts a turn</div>');
+    '<code>/cosmos</code> tours five mathematical worlds · <code>/stop</code> aborts a turn</div>');
 }
 
 /* Identity questions are answered here, in the interface, so the answer is
@@ -4638,6 +4960,7 @@ function submit(v){
   CINE.shot({yaw:-.072,pitch:.020,dolly:-.26,hold:.55,decay:1.6});
   if(/^\/(stop|abort)$/.test(v)){ abort(); return; }
   if(/^\/demo\b/i.test(v)){ demoCommand(v); return; }
+  if(/^\/cosmos\b/i.test(v)){ cosmosCommand(v); return; }
   if(/^\/(states|modes|help)$/i.test(v)){ statesCommand(); return; }
   if(/^\/connect\b/i.test(v)){ connectCommand(v); return; }
   if(/^\/model\b/i.test(v)){ modelCommand(v); return; }
@@ -4821,7 +5144,9 @@ function finishBoot(msg){
   function immersionFrame(now){
     requestAnimationFrame(immersionFrame);
     const dt=Math.min(.05,(now-lastT)/1000||.016);lastT=now;
-    const tt=now*.001;
+    if(document.hidden)return;
+    const tt=reduced?0:now*.001;
+    iu.uPR.value=RPR;
     iu.uTime.value=tt;
     iu.uEnergy.value=energy;
     iu.uPulse.value=Math.min(1,pulseV+surge*.35);
