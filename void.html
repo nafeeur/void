@@ -1047,19 +1047,34 @@ const compMat=new THREE.ShaderMaterial({
             uBloom:{value:1.35},uTime:{value:0},uShift:{value:0},
             uLensPos:{value:new THREE.Vector2(.5,.5)},uLensStr:{value:0},
             uHorizon:{value:.04},uAspect:{value:1},uShimmer:{value:0},
-            uNebula:{value:.32},uVolume:{value:.35},uEnergyFx:{value:0}},
+            uNebula:{value:.32},uVolume:{value:.35},uEnergyFx:{value:0},
+            uEchoAge:{value:10},uEchoPower:{value:0}},
   vertexShader:quadVert,
   fragmentShader:`
     uniform sampler2D tScene;uniform sampler2D tBloomA;uniform sampler2D tBloomB;
     uniform float uBloom;uniform float uTime;uniform float uShift;
     uniform vec2 uLensPos;uniform float uLensStr;uniform float uHorizon;uniform float uAspect;
     uniform float uShimmer;uniform float uNebula;uniform float uVolume;uniform float uEnergyFx;
+    uniform float uEchoAge;uniform float uEchoPower;
     varying vec2 vUv;
     float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
     float noise2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x),f.y);}
     float fbm(vec2 p){float a=.5,n=0.0;for(int i=0;i<5;i++){n+=noise2(p)*a;p=p*2.03+vec2(17.2,9.1);a*=.5;}return n;}
     void main(){
       vec2 uv=vUv;
+      // A bounded, traveling refraction: no full-screen exposure flash.
+      // Aspect correction keeps the echo circular on portrait displays.
+      if(uEchoPower>0.001 && uEchoAge<2.8){
+        vec2 ed=(uv-uLensPos)*vec2(uAspect,1.0);
+        float er=length(ed);
+        float front=uEchoAge*.24;
+        float envelope=sin(clamp(uEchoAge/2.8,0.0,1.0)*3.141593);
+        float band=exp(-pow((er-front)/.026,2.0));
+        float wake=exp(-pow((er-front+.045)/.045,2.0));
+        uv+=ed/max(er,.001)*vec2(1.0/uAspect,1.0)
+          *(band-wake*.38)*envelope*uEchoPower*.007;
+        uv=clamp(uv,vec2(.001),vec2(.999));
+      }
 
       /* Gravitational lensing, done in screen space. Every sample is pulled
          toward the core, with the deflection falling off as 1/r2 and dying
@@ -1332,6 +1347,62 @@ const shared={uTime:{value:0},uAmp:{value:0},uScan:{value:-1.5},uPulse:{value:0}
               uRadK:{value:1},uEnergy:{value:0},uTint:{value:0},
               uFocus:{value:7.5},uAperture:{value:.055},uPR:{value:PR},uTex:{value:TEX}};
 const u=x=>Object.assign({},shared,x);
+
+/* ---- orbital filaments ----
+   One draw call, immutable geometry, GPU-driven motion. The traveling
+   crests expose the curves a piece at a time, leaving the core readable.
+   Sharing the halo fade keeps these within each state's composition. */
+const filamentCount=12, filamentSteps=160;
+const filamentPositions=new Float32Array(filamentCount*filamentSteps*2*3);
+let filamentCursor=0;
+for(let strand=0;strand<filamentCount;strand++){
+  for(let step=0;step<filamentSteps;step++){
+    for(let endpoint=0;endpoint<2;endpoint++){
+      filamentPositions[filamentCursor++]=(step+endpoint)/filamentSteps;
+      filamentPositions[filamentCursor++]=strand;
+      filamentPositions[filamentCursor++]=0;
+    }
+  }
+}
+const filamentGeo=new THREE.BufferGeometry();
+filamentGeo.setAttribute('position',new THREE.BufferAttribute(filamentPositions,3));
+const filamentMat=new THREE.ShaderMaterial({
+  uniforms:u({uFade:{value:1},uFlow:{value:0},uTravel:{value:0},uWeave:{value:0}}),
+  vertexShader:FIELD+`
+    uniform float uFlow;uniform float uTravel;uniform float uWeave;
+    varying float vLight;varying float vBand;
+    void main(){
+      float strand=position.y;
+      float path=position.x;
+      float phase=strand*2.399963;
+      float angle=path*6.283185+phase+uTime*.065;
+      float braid=angle*3.0+phase+uTime*.16;
+      float radius=1.7+strand*.055+sin(braid)*(.07+uWeave*.19);
+      vec3 p=vec3(cos(angle)*radius,
+        sin(angle*2.0+phase)*(.12+uWeave*.24),sin(angle)*radius);
+      float tilt=.32+sin(phase)*.48;
+      p.yz=mat2(cos(tilt),-sin(tilt),sin(tilt),cos(tilt))*p.yz;
+      float crest=.5+.5*cos(angle-uTravel-phase);
+      vLight=.025+pow(crest,24.0)*(.35+uFlow*.65);
+      vBand=strand/12.0;
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0);
+    }`,
+  fragmentShader:FIELD+`
+    uniform float uFade;varying float vLight;varying float vBand;
+    void main(){
+      vec3 c=hueRot(ramp(clamp(uEnergy*.7+.2+vBand*.12,0.0,1.0)),uTint+vBand*.65);
+      gl_FragColor=vec4(c*vLight,vLight*uFade*.48);
+    }`,
+  transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+});
+// reg() shares the existing halo composition rather than adding another layer
+// to every state. No texture, render target, or per-frame geometry allocation.
+reg(filamentMat,'halo');
+const filaments=new THREE.LineSegments(filamentGeo,filamentMat);
+filaments.frustumCulled=false;
+core.add(filaments);
+let echoAge=10,echoPower=0;
+const braidedModes=new Set(['weave','think','crystal','spiral']);
 
 /* ---- particle cloud ---- */
 const CLOUD_N=9000;
@@ -2693,6 +2764,7 @@ function startMode(name){
               hold:1.1,decay:2.2});}
   recent.push(name);if(recent.length>4)recent.shift();
   MODES[name].enter();
+  if(!reduced){echoAge=0;echoPower=.45+Math.min(.55,energy*.55)}
 }
 function requestMode(name){
   if(!MODES[name]||demoLock)return;
@@ -3376,7 +3448,14 @@ const lensC=new THREE.Vector3(),lensE=new THREE.Vector3(),lensUp=new THREE.Vecto
 const coreScreen={x:0,y:0};
 const scanEl=$('scanline'), cycleEl=document.querySelector('#cycle i');
 const clock=new THREE.Clock();
-const reduced=matchMedia('(prefers-reduced-motion:reduce)').matches;
+let animationTime=0;
+const motionQuery=matchMedia('(prefers-reduced-motion:reduce)');
+let reduced=motionQuery.matches;
+motionQuery.addEventListener('change',event=>{
+  reduced=event.matches;
+  if(reduced){echoAge=10;echoPower=0}
+  setQuality(QL.level);
+});
 let TRAILS=!reduced;
 outMat.uniforms.tTrail.value=rtT1.texture;
 if(!TRAILS) outMat.uniforms.uGain.value=0;
@@ -3439,7 +3518,20 @@ const CINE={
 
 function tick(){
   requestAnimationFrame(tick);
-  const dt=Math.min(clock.getDelta(),.05),t=clock.elapsedTime;
+  // Advance visual time only while visible; bound the first returning frame.
+  const elapsed=clock.getDelta();
+  if(document.hidden)return;
+  const dt=Math.min(elapsed,.05);
+  const t=animationTime+=dt;
+  echoAge+=dt;
+  compMat.uniforms.uEchoAge.value=echoAge;
+  compMat.uniforms.uEchoPower.value=reduced||QL.level>=2?0:echoPower;
+  filaments.visible=!reduced&&QL.level<3;
+  filamentGeo.setDrawRange(0,(QL.level>=2?6:filamentCount)*filamentSteps*2);
+  filamentMat.uniforms.uFlow.value=damp(filamentMat.uniforms.uFlow.value,energy,2.5,dt);
+  filamentMat.uniforms.uTravel.value+=dt*(.36+filamentMat.uniforms.uFlow.value*.7);
+  const weaveTarget=braidedModes.has(mode)?1:0;
+  filamentMat.uniforms.uWeave.value=damp(filamentMat.uniforms.uWeave.value,weaveTarget,1.4,dt);
 
   // frame-time watchdog: a slow exponential average, so one hitch never
   // triggers a downgrade but a genuinely struggling machine always does
@@ -3829,7 +3921,7 @@ function tick(){
     // longer trails the harder the core is working
     trailMat.uniforms.tCur.value=rtComp.texture;
     trailMat.uniforms.tPrev.value=trailPrev.texture;
-    trailMat.uniforms.uDecay.value=Math.min(.94,.70+energy*.20+pulseV*.10+surge*.05);
+    trailMat.uniforms.uDecay.value=Math.pow(Math.min(.94,.70+energy*.20+pulseV*.10+surge*.05),dt*60);
     renderer.setRenderTarget(trailCur);renderer.render(trailScene,quadCam);
     const swap=trailPrev;trailPrev=trailCur;trailCur=swap;
     outMat.uniforms.tTrail.value=trailPrev.texture;
@@ -4821,7 +4913,9 @@ function finishBoot(msg){
   function immersionFrame(now){
     requestAnimationFrame(immersionFrame);
     const dt=Math.min(.05,(now-lastT)/1000||.016);lastT=now;
-    const tt=now*.001;
+    if(document.hidden)return;
+    const tt=reduced?0:now*.001;
+    iu.uPR.value=RPR;
     iu.uTime.value=tt;
     iu.uEnergy.value=energy;
     iu.uPulse.value=Math.min(1,pulseV+surge*.35);
