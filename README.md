@@ -11,8 +11,28 @@
 | ![crystal](screenshots/crystal.jpg) **crystal** — a planning state, the lattice locks into place | ![shield](screenshots/shield.jpg) **shield** — waiting on you, shields lock until answered | ![overload](screenshots/overload.jpg) **overload** — heavy concurrent work, the core runs hot and red |
 | ![nova](screenshots/nova.jpg) **nova** — sustained overload, the core blazes over | ![flare](screenshots/flare.jpg) **flare** — a hard flash on error, decaying back | ![collapse](screenshots/collapse.jpg) **collapse** — a fault, maximum curvature, the horizon takes the frame |
 
-Type `/states` in the dock to see the full list of 22, or `/demo` to watch
+Type `/states` in the dock to see the full list of 27, or `/demo` to watch
 VOID cycle through all of them, or `/demo <name>` to hold one and study it.
+
+## The cosmic score
+
+Type `/cosmos` for a slow tour of five mathematical scenes. Use `/cosmos off`
+to return to live activity, or `/demo <name>` to hold a scene.
+
+| Scene | Structure |
+|---|---|
+| `hopf` | 24 linked circles from phase orbits on the 3-sphere, stereographically projected into 3D |
+| `attractor` | A Lorenz orbit integrated with fourth-order Runge–Kutta, with the initial transient discarded |
+| `orrery` | Nine closed (2,3) torus knots, their planes distributed by the golden angle |
+| `cathedral` | 13 paired logarithmic spiral ribbons, expanding by the golden ratio per revolution |
+| `chrysalis` | 5,200 Fibonacci sphere samples carrying two interfering standing-wave modes |
+
+These are mathematical visualizations composed as artwork, not physical
+simulations of celestial objects. Each scene gives one structure the lead;
+quieter accents also accompany thinking, streaming, editing, and planning.
+Geometry is built once and animated on the GPU. The new sculptures freeze
+under reduced motion and reduce detail with the existing quality watchdog.
+No additional dependencies or API connection are required.
 
 ## Bring your own model
 
@@ -62,6 +82,8 @@ Everything happens in the one input field at the bottom:
 | `/model <name>` | Switch models without touching the rest of the config |
 | `/key <key>` | Update the API key in place |
 | `/states` | List every visual state and what triggers it |
+| `/cosmos` | Tour the five mathematical scenes at a slower pace |
+| `/cosmos off` | Return to live activity |
 | `/demo` | Tour all states automatically |
 | `/demo <name>` | Hold one state so you can look at it |
 | `/demo off` | Release the demo and return to live activity |
