@@ -14,26 +14,6 @@
 Type `/states` in the dock to see the full list of 27, or `/demo` to watch
 VOID cycle through all of them, or `/demo <name>` to hold one and study it.
 
-## The cosmic score
-
-Type `/cosmos` for a slow tour of five mathematical scenes. Use `/cosmos off`
-to return to live activity, or `/demo <name>` to hold a scene.
-
-| Scene | Structure |
-|---|---|
-| `hopf` | 24 linked circles from phase orbits on the 3-sphere, stereographically projected into 3D |
-| `attractor` | A Lorenz orbit integrated with fourth-order Runge–Kutta, with the initial transient discarded |
-| `orrery` | Nine closed (2,3) torus knots, their planes distributed by the golden angle |
-| `cathedral` | 13 paired logarithmic spiral ribbons, expanding by the golden ratio per revolution |
-| `chrysalis` | 5,200 Fibonacci sphere samples carrying two interfering standing-wave modes |
-
-These are mathematical visualizations composed as artwork, not physical
-simulations of celestial objects. Each scene gives one structure the lead;
-quieter accents also accompany thinking, streaming, editing, and planning.
-Geometry is built once and animated on the GPU. The new sculptures freeze
-under reduced motion and reduce detail with the existing quality watchdog.
-No additional dependencies or API connection are required.
-
 ## Bring your own model
 
 VOID doesn't ship a backend. It talks directly, from the browser, to
